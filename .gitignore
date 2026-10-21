@@ -1,0 +1,10 @@
+# 密钥与本地数据，绝不入库
+env.sh
+mapping.db
+mapping.db-shm
+mapping.db-wal
+logs/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
