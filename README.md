@@ -1,197 +1,302 @@
-# kb-article-sync
+# KB-Article-Sync: Enterprise CMS-to-Dify Knowledge Base Synchronization Gateway
 
-把业务系统的文章推送进 Dify 知识库的同步服务。它解决的不只是「把文件传进去」：在入库的同时，把 **`article_id`（文章编号）** 和 **`source_url`（原文地址）** 写入 Dify 文档元数据，后续检索命中后可以直接：
+[English](README.md) | [中文](README_zh.md)
 
-- 用 `article_id` 和业务系统做权限比对（员工有没有权限看这篇）；
-- 用 `source_url` 在答案里回链原文。
+A decoupled, production-grade synchronization gateway that bridges enterprise Content Management Systems (CMS, OA, wikis) with **Dify Knowledge Base (RAG)**. It automates file ingestion, provisions dual-purpose metadata (`article_id` for RBAC permission checks, `source_url` for answer citation backlinks), and manages document lifecycles through hierarchical parent-child chunking.
 
-服务与 Dify 源码目录完全隔离，只通过 HTTP 调用 Dify 的 Service API。
+---
 
-## 目录结构
+## Architecture Overview
+
+In enterprise RAG deployments, synchronizing external knowledge into Dify requires more than simple file uploads:
+1. **Access Control (RBAC)**: Search and retrieval pipelines must verify employee read permissions against enterprise article IDs (`article_id`) after retrieval.
+2. **Citation Source Linking**: AI assistant responses need direct hyperlinks (`source_url`) pointing back to the original portal article.
+3. **Decoupled Maintenance**: Modifying Dify source code directly introduces severe maintenance debt during upstream updates.
+4. **Idempotency & Cost Control**: Uncontrolled re-indexing burns expensive vectorization credits and embedding model tokens.
+
+`kb-article-sync` operates as an independent synchronization gateway deployed alongside Dify. It interacts exclusively via Dify's public Service REST API, ensuring zero coupling with Dify's internal codebase.
 
 ```
-.
-├── post.py            接口代码
-├── env.example.sh     密钥/配置示例（复制为 env.sh 后填写）
-├── requirements.txt   Python 依赖
-├── run.sh             前台启动（调试用）
-├── tmux.sh            后台常驻：start / stop / restart / status / logs / attach
-├── start.sh           等同 ./tmux.sh start
-├── stop.sh            等同 ./tmux.sh stop
-├── selftest.sh        自测脚本，一条命令验完所有行为
-├── mapping.db         article_id <-> Dify document_id 映射表（运行时生成，不入库）
-└── logs/app.log       日志（运行时生成，不入库）
++----------------------------------------------------------------------------------------------------+
+|                                    Enterprise Architecture Overview                                |
+|                                                                                                    |
+|  +--------------------+                                                                            |
+|  | Enterprise CMS /   |                                                                            |
+|  | Knowledge Systems  |                                                                            |
+|  +--------------------+                                                                            |
+|            |                                                                                       |
+|            | 1. Batch / Single Push (JSON / Multipart)                                             |
+|            v                                                                                       |
+|  +----------------------------------------------------------------------------------------------+  |
+|  |                                  kb-article-sync Gateway                                     |  |
+|  |                                                                                              |  |
+|  |  +------------------------+  +-------------------------+  +-------------------------------+  |  |
+|  |  | Token Auth & Isolation |  | Timestamp Cache Check   |  | Hierarchical Chunk Formatter  |  |  |
+|  |  | (X-KB-Sync-Token)      |  | (SQLite mapping.db)     |  | (1024 Parent / 200 Child)     |  |  |
+|  |  +------------------------+  +-------------------------+  +-------------------------------+  |  |
+|  |              |                            |                               |                  |  |
+|  |              v                            v                               v                  |  |
+|  |  +----------------------------------------------------------------------------------------+  |  |
+|  |  | Dynamic Metadata Binding (source_url, article_id) & In-Place / Recreate State Machine  |  |  |
+|  |  +----------------------------------------------------------------------------------------+  |  |
+|  +----------------------------------------------------------------------------------------------+  |
+|            |                                                                                       |
+|            | 2. Standard Service REST API Calls (HTTP)                                             |
+|            v                                                                                       |
+|  +----------------------------------------------------------------------------------------------+  |
+|  |                                       Dify Service API                                       |  |
+|  |                                                                                              |  |
+|  |  +------------------------------+     +---------------------------------------------------+  |  |
+|  |  | Dataset Custom Metadata API |     | Document Ingestion & Vector Indexing Pipeline     |  |  |
+|  |  | (article_id, source_url)     |     | (Hierarchical Model: High Precision Search)       |  |  |
+|  |  +------------------------------+     +---------------------------------------------------+  |  |
+|  +----------------------------------------------------------------------------------------------+  |
++----------------------------------------------------------------------------------------------------+
 ```
 
-## 为什么不会影响 Dify 源码更新
+---
 
-- 本服务放在 Dify 源码目录的**同级目录**，没有一行代码写进 Dify。
-- 不 `import` 任何 Dify 代码，不共享它的 Python 环境和依赖，自带 `venv/`。
-- 只通过 HTTP 调用 Dify 的 Service API，和浏览器访问走同一个口子。
-- 因此在 Dify 目录里 `git pull / rebase / 改代码 / 重新 build`，本服务毫无感知；反过来本服务重启也不影响 Dify。
-- 唯一耦合点是 Dify 的 Service API 契约。升级 Dify 后如果接口有变动，只需要改 `post.py`。
+## Key Capabilities
 
-## 快速开始
+- **Zero-Intrusion Decoupled Architecture**: Communicates strictly via standard Dify Service APIs. Upgrades, rebases, or docker restarts on Dify require zero changes to this service.
+- **Dual-Purpose Metadata Backfilling**: Dynamically creates and injects custom metadata attributes into Dify datasets:
+  - `article_id`: Enables post-retrieval permission checking (RBAC/ACL) against the corporate identity system before surfacing answers to users.
+  - `source_url`: Provides one-click original document backlinks in the assistant's citation footers.
+- **Hierarchical (Parent-Child) Chunking**: Configures two-tier semantic chunking by default (`doc_form="hierarchical_model"`):
+  - **Parent Chunks (1024 tokens)**: Injected into the LLM context window to provide rich surrounding paragraph context.
+  - **Child Sub-chunks (200 tokens)**: High-resolution units indexed in the vector database for pinpoint similarity retrieval.
+- **Idempotency & Change Detection**: Tracks publication timestamps (`updated_at`) in a local SQLite store (`mapping.db`). Unchanged articles are skipped automatically, preventing redundant embedding costs.
+- **Self-Healing Update Lifecycle**: Attempts native in-place updates (`update-by-file`). If Dify rejects the update with HTTP 400 (e.g. document still indexing, archived, or disabled), the service automatically falls back to an atomic delete-and-recreate sequence.
+- **Fault-Tolerant Partial Processing**: Batch endpoints validate entries individually. Corrupted items return structured failure details without blocking valid items in the same payload.
+- **Safety-Guarded Full Reconciliation (`full_sync: true`)**: Prunes unlisted stale documents only when the incoming batch has zero validation errors, eliminating the risk of accidental bulk data deletion caused by corrupt inputs.
+
+---
+
+## Directory Structure
+
+```
+kb-article-sync/
+├── post.py            # Core Flask sync service & state machine
+├── env.example.sh     # Configuration template (tokens, endpoints, dataset ID)
+├── requirements.txt   # Minimal Python dependencies (flask, requests)
+├── tmux.sh            # Non-root daemon supervisor (start/stop/restart/logs/status)
+├── start.sh           # Shortcut to ./tmux.sh start
+├── stop.sh            # Shortcut to ./tmux.sh stop
+├── run.sh             # Foreground debugging launcher
+├── selftest.sh        # Automated end-to-end integration test suite
+├── mapping.db         # Local SQLite state mapping (runtime-generated, gitignored)
+└── logs/app.log       # Application execution logs (runtime-generated, gitignored)
+```
+
+---
+
+## Quickstart
+
+### 1. Installation
+Deploy to your application server (e.g., `/opt/kb-sync`):
 
 ```bash
-cd /opt/kb-sync                # 换成你的部署目录
+cd /opt/kb-sync
 python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
+```
 
+### 2. Configure Environment
+Copy `env.example.sh` to `env.sh` and populate your credentials:
+
+```bash
 cp env.example.sh env.sh
-vi env.sh                     # 填入 DIFY_API_KEY / KB_SYNC_TOKEN / DIFY_DATASET_ID
 chmod 600 env.sh
+vi env.sh
+```
 
+### 3. Start the Daemon & Verify
+```bash
+# Start background service
 ./tmux.sh start
+
+# Check service status
+./tmux.sh status
+
+# Run the comprehensive integration test suite
 ./selftest.sh
 ```
 
-## 日常操作
+---
 
-```bash
-./tmux.sh start      # 启动（并自动打一次 /healthz）
-./tmux.sh status     # 看状态
-./tmux.sh stop       # 停止
-./tmux.sh restart    # 重启
-./tmux.sh logs       # 实时看日志（Ctrl+C 只是退出，服务不停）
-./tmux.sh attach     # 进会话看输出（退出按 Ctrl+B，松开再按 D，服务不停）
-./selftest.sh        # 自测
+## Configuration Reference
+
+| Environment Variable | Default Value | Description |
+|---|---|---|
+| `DIFY_API_KEY` | `""` | Dify Knowledge Base Service API Key (`app-...`). |
+| `KB_SYNC_TOKEN` | `""` | Shared authentication secret required in `X-KB-Sync-Token` request headers. |
+| `DIFY_DATASET_ID` | `00000000-...` | Target Dify Knowledge Base dataset UUID. |
+| `DIFY_BASE` | `http://127.0.0.1:8080/v1` | Dify API base endpoint. |
+| `PORT` | `8090` | Port on which the synchronization service listens. |
+| `META_FIELDS` | `source_url,article_id` | Metadata fields to provision and write into Dify documents. |
+| `MAPPING_DB` | `./mapping.db` | Path to the local SQLite state store. |
+
+---
+
+## API Reference
+
+All requests must include the header:
+```http
+X-KB-Sync-Token: <KB_SYNC_TOKEN>
 ```
 
-改端口/密钥：编辑 `env.sh`，然后 `./tmux.sh restart`。
+### 1. Batch Article Push
+- **Path**: `POST /sync/kb/article/push`
+- **Content-Type**: `application/json`
+- **Batch Limit**: 200 items per request
 
-### 为什么用 tmux
-
-服务跑在一个独立的 tmux 会话里，**ssh 断开、终端关掉都不会把它带走**，效果和 systemd 常驻一样，但全程普通用户权限，不需要 `sudo`。
-
-注意：机器重启后 tmux 会话没了，服务不会自己起来。重启后执行一次 `./tmux.sh start` 即可（日志追加写，不丢历史）。
-
-如果同一台机器上还有别人的 tmux 会话：
-
-- 不要执行 `tmux kill-server`，那会顺手把别人的会话也杀掉；
-- 停服务只用 `./tmux.sh stop`，它只动 `kb-sync` 这一个会话。
-
-## 环境变量
-
-| 变量 | 说明 |
-|---|---|
-| `DIFY_API_KEY` | 知识库的 Service API 密钥 |
-| `KB_SYNC_TOKEN` | 给对方调用的固定令牌 |
-| `DIFY_DATASET_ID` | 目标知识库 id |
-| `DIFY_BASE` | Dify Service API 地址，例如 `http://127.0.0.1:8080/v1` |
-| `PORT` | 本服务端口，默认 8090 |
-| `META_FIELDS` | 额外写进 Dify 文档元数据的业务字段，逗号分隔，默认 `source_url,article_id`；`article_id` 是检索后鉴权比对用的，不要去掉 |
-
-元数据字段的 id 是挂在**具体知识库**下的。换 `DIFY_DATASET_ID` 之后不用手工清缓存（缓存键里带了 dataset_id）；但如果是从更早版本升上来的，建议先把 `kb_config` 表清空一次。
-
-## 对外接口
-
-监听 `0.0.0.0:8090`。所有接口都要带 `X-KB-Sync-Token`，不对返回 403。
-
-### 1. 批量推送 `POST /sync/kb/article/push`（正式入口）
-
-`Content-Type: application/json`，单次最多 200 条。
-
+#### Request Body
 ```json
 {
   "full_sync": false,
   "items": [
     {
-      "article_id": 17,
-      "title": "研发测试规范",
-      "file_name": "研发测试规范.docx",
-      "file_url": "https://cms.example.com/files/17.docx",
-      "source_url": "https://cms.example.com/article/17",
+      "article_id": 1001,
+      "title": "Engineering Standards and Best Practices",
+      "file_name": "engineering_standards.docx",
+      "file_url": "https://cms.internal.example.com/files/1001.docx",
+      "source_url": "https://cms.internal.example.com/article/1001",
       "publish_status": "published",
-      "updated_at": "2026-09-20T14:48:00+08:00",
-      "category": "技术中心/研发规范",
-      "author": "研发中心",
-      "secret_level": "内部"
+      "updated_at": "2026-10-20T10:00:00+08:00",
+      "category": "R&D / Standards",
+      "author": "Tech Committee",
+      "secret_level": "Internal"
     }
   ]
 }
 ```
 
-逐条校验，一条不合格只退那一条：
-
+#### Response (`200 OK`)
 ```json
-{"code":200,"status":"partial","msg":"部分数据未通过校验",
- "data":{"accepted":1,"rejected":1,"offline":0,
-         "errors":[{"index":1,"article_id":21,"field":"file_name",
-                    "reason":"file_name 不能为空"}]}}
+{
+  "code": 200,
+  "status": "success",
+  "msg": "Batch processing completed",
+  "data": {
+    "accepted": 1,
+    "rejected": 0,
+    "offline": 0,
+    "errors": []
+  }
+}
 ```
 
-`full_sync: true` 时，不在本批的在线文章会被下线；**只有本批零错误才会执行下线扫描**，避免脏数据误删整库。
+If individual items fail validation, the endpoint returns HTTP 200 with partial status:
+```json
+{
+  "code": 200,
+  "status": "partial",
+  "msg": "Some items failed validation",
+  "data": {
+    "accepted": 1,
+    "rejected": 1,
+    "offline": 0,
+    "errors": [
+      {
+        "index": 1,
+        "article_id": 1002,
+        "field": "file_name",
+        "reason": "file_name cannot be empty"
+      }
+    ]
+  }
+}
+```
 
-### 2. 单条推送 `POST /api/sync_article`
+---
 
-文件直接带过来时用，`multipart/form-data`。
-
-| 字段 | 必填 | 说明 |
-|---|---|---|
-| article_id | 是 | 文章 id，正整数 |
-| file | 是（published 时） | 文件本体，扩展名限 txt/markdown/md/mdx/pdf/html/htm/xlsx/xls/docx/csv/vtt/properties/odt/pptx |
-| title | 否 | 文章标题，用作知识库文档名；不给就用文件名 |
-| source_url | 建议 | 原文地址，只存不下载 |
-| publish_status | 否 | `published`（默认）/ `unpublished` / `deleted` |
+### 2. Single Article Push (Direct File Upload)
+- **Path**: `POST /api/sync_article`
+- **Content-Type**: `multipart/form-data`
 
 ```bash
-curl -F "article_id=999" -F "title=演示文档" \
-     -F "source_url=https://cms.example.com/article/999" \
-     -F "file=@/tmp/demo.md" \
+curl -F "article_id=1001" \
+     -F "title=Engineering Standards" \
+     -F "source_url=https://cms.internal.example.com/article/1001" \
+     -F "publish_status=published" \
+     -F "file=@/path/to/standards.docx" \
      -H "X-KB-Sync-Token: $KB_SYNC_TOKEN" \
      http://127.0.0.1:8090/api/sync_article
 ```
 
-### 3. 反查 `GET /api/article_meta?article_id=999`
+---
 
-拿 article_id 换 `document_id` / `doc_name` / `source_url` / `online`。
+### 3. Metadata Reverse Lookup
+- **Path**: `GET /api/article_meta?article_id=1001`
 
-### 4. 健康检查 `GET /healthz`
+Returns local mapping details including `document_id`, `source_url`, and online status:
+```json
+{
+  "code": 200,
+  "data": {
+    "article_id": 1001,
+    "document_id": "4e7235a1-7734-4b5c-b17f-4c12690184b2",
+    "doc_name": "Engineering Standards",
+    "source_url": "https://cms.internal.example.com/article/1001",
+    "online": true
+  }
+}
+```
 
-返回 `online_articles`，即当前在线的文章条数，可以拿它当对账指标。
+---
 
-## 内部行为
+### 4. Health & Status Check
+- **Path**: `GET /healthz`
 
-- **文档名**用 `title`（去掉 `\ / : * ? " < > |` 等非法字符），不是 `file_name`。
-- **`updated_at` 相同则跳过**，不重复上传、不重复消耗索引额度。所以对方最好稳定地传这个值。
-- **原地更新失败会删除重建**：Dify 只在文档「索引完成 + 未归档 + 已启用」时允许 `update-by-file`，文档还在索引中、或上次索引失败时会回 400 `Document is not available`。这时本服务会自动删掉旧文档重新上传，日志里打印 `当前不可原地更新，改为删除重建`。
-- **元数据写入是尽力而为**：`META_FIELDS` 里的字段会自动在 Dify 建好并写入文档元数据，失败只记日志、不会让推送整体失败。默认写两项：`source_url`（答案回链原文）和 `article_id`（检索后鉴权比对，值是正整数编号的字符串形式）。
-- **`publish_status`**：只有 `published` 才入库。`unpublished`（撤回发布）和 `deleted`（文章删除）都会把这个 `article_id` 从知识库里摘掉，并把映射标记为下线，避免员工还能检索到已经下架的旧内容。
+Returns online article counts for monitoring and reconciliation:
+```json
+{
+  "status": "ok",
+  "online_articles": 1420
+}
+```
 
-## 切分策略
+---
 
-`post.py` 里的 `PROCESS_RULE` 显式指定了父子分段：
+## Operations & Process Management
 
-- `doc_form = hierarchical_model`（这是顶层字段，Dify 靠它选分段器，缺了会静默落回普通切分）；
-- 父块 `max_tokens=1024`，只作为上下文回带给模型，不进向量库；
-- 子块 `max_tokens=200`，真正被向量化、被检索命中的单元。
-
-父块/子块参数需要和你的文档形态一起调；改完重新推送（或先删文档）才会生效。
-
-## 自测
-
-一条命令跑完所有行为，跑完自动清理。全程只用假的 `article_id`（`999999001`），**不会动真实文章**：
+The service includes `tmux.sh`, a dedicated process manager designed for enterprise server environments without requiring `root` or `sudo` privileges:
 
 ```bash
-./tmux.sh start
+./tmux.sh start      # Starts service daemon and verifies /healthz
+./tmux.sh status     # Checks daemon running status
+./tmux.sh logs       # Tails real-time logs (Ctrl+C to exit viewing, process keeps running)
+./tmux.sh attach     # Attaches to interactive console session (Detach with Ctrl+B, then D)
+./tmux.sh restart    # Restarts daemon with fresh configuration
+./tmux.sh stop       # Gracefully terminates the daemon session
+```
+
+---
+
+## Automated Verification (`selftest.sh`)
+
+Run `./selftest.sh` to execute the full automated test suite against a live or staging Dify instance:
+
+```bash
 ./selftest.sh
 ```
 
-覆盖：无令牌被 403 挡掉、新增、`updated_at` 没变则跳过、覆盖更新、坏数据只退单条、`/api/article_meta` 反查、直接问 Dify 确认 `source_url` 和 `article_id` 两项元数据都写进去了、撤回发布确实把文档摘掉、`full_sync` 下线，以及「批次里有错误就绝不下线」的安全闸，最后把测试数据删干净并核对条数复原。
+**Tested Assertions**:
+1. Unauthorized request rejection (HTTP 403 on missing or invalid token).
+2. Mock file server provisioning.
+3. First-time document creation and ingestion.
+4. Idempotency verification (identical `updated_at` triggers immediate skip without re-indexing).
+5. Document content update propagation.
+6. Validation fault-isolation (corrupt record rejection does not block valid record).
+7. Metadata reverse lookup via `/api/article_meta`.
+8. Remote Dify API verification: confirms both `source_url` and `article_id` metadata are persisted.
+9. Unpublish lifecycle (unpublishing cleanly removes the document from Dify).
+10. Safe full reconciliation test and automated test data cleanup.
 
-两点说明：
+---
 
-- `full_sync` 下线测试**只在知识库为空时才会跑**，避免误删真实数据。
-- 脚本直接读 `env.sh` 里的密钥去问 Dify，所以要在服务器上跑。
+## Security Best Practices
 
-## 日志与数据
-
-- 日志：`logs/app.log`
-- 映射表：`sqlite3 mapping.db "select article_id, document_id, source_url, status from kb_document_mapping;"`
-
-## 安全提示
-
-- `env.sh` 权限设为 600，且已在 `.gitignore` 中排除，不要提交到仓库。
-- `KB_SYNC_TOKEN` 建议用足够长的随机串，泄露后立即更换并重启服务。
-- `mapping.db` 含文章编号与文档 id 的对应关系，同样不要入库或外发。
+- **File Permissions**: Restrict `env.sh` permissions to `chmod 600 env.sh`. Never commit production credentials to version control.
+- **Token Entropy**: Set `KB_SYNC_TOKEN` to a cryptographically secure random string (e.g. `openssl rand -hex 32`).
+- **Database Backup**: Regularly back up `mapping.db` to protect synchronization state history.
